@@ -1,0 +1,104 @@
+groups:
+  # ===========================================================================
+  # SLO: 99.95% success rate (allows max 0.05% errors)
+  # This alert would have caught the Diwali incident within 2 minutes.
+  # ===========================================================================
+  - name: authorizer_slo
+    rules:
+      # ── Critical: Success rate below SLO threshold (fires fast) ─────────────
+      - alert: AuthorizerSuccessRateCritical
+        expr: |
+          authorizer_success_rate < 0.9995
+        for: 2m
+        labels:
+          severity: critical
+          team: payments
+        annotations:
+          summary: "CRITICAL: Authorization success rate below SLO ({{ $value | humanizePercentage }})"
+          description: |
+            The transaction-authorizer success rate is {{ $value | humanizePercentage }},
+            below the 99.95% SLO target. At 5,000 req/s this means
+            {{ printf "%.0f" (mul (sub 1 $value) 5000) }} failed authorizations per second.
+            Immediate investigation required — consider rolling back the current deployment.
+          runbook: "https://wiki.yuno.io/runbooks/authorizer-slo-breach"
+
+      # ── Warning: Canary specifically degraded ───────────────────────────────
+      - alert: CanarySuccessRateDegraded
+        expr: |
+          authorizer_success_rate{deployment_role="canary"} < 0.995
+        for: 1m
+        labels:
+          severity: warning
+          team: payments
+        annotations:
+          summary: "Canary version {{ $labels.version }} has elevated error rate ({{ $value | humanizePercentage }})"
+          description: |
+            The canary deployment is experiencing errors above threshold.
+            Auto-halt of rollout recommended. Current rate: {{ $value | humanizePercentage }}.
+          runbook: "https://wiki.yuno.io/runbooks/canary-degraded"
+
+      # ── Critical: Canary complete failure ───────────────────────────────────
+      - alert: CanaryCompletelyFailing
+        expr: |
+          authorizer_success_rate{deployment_role="canary"} < 0.50
+        for: 30s
+        labels:
+          severity: critical
+          team: payments
+        annotations:
+          summary: "Canary COMPLETELY FAILING - immediate rollback required"
+          description: |
+            Canary version {{ $labels.version }} success rate is {{ $value | humanizePercentage }}.
+            This matches the Diwali incident pattern. AUTOMATED ROLLBACK TRIGGERED.
+
+  # ===========================================================================
+  # Latency SLO: p95 < 500ms, p99 < 1s
+  # ===========================================================================
+  - name: authorizer_latency
+    rules:
+      - alert: AuthorizerHighLatency
+        expr: |
+          authorizer_active_connections > 500
+        for: 3m
+        labels:
+          severity: warning
+          team: payments
+        annotations:
+          summary: "High active connection count on authorizer ({{ $value }})"
+          description: |
+            Active connections are elevated, which may indicate latency issues.
+            Check for connection pool exhaustion or upstream provider slowness.
+
+  # ===========================================================================
+  # Deployment health checks
+  # ===========================================================================
+  - name: deployment_health
+    rules:
+      # Alert if any instance is down
+      - alert: AuthorizerInstanceDown
+        expr: |
+          up{job=~"authorizer.*"} == 0
+        for: 1m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Authorizer instance {{ $labels.instance }} is unreachable"
+          description: |
+            Prometheus cannot scrape metrics from {{ $labels.instance }}.
+            This may indicate the container crashed or failed health checks.
+
+      # Alert if canary has been running more than 30 min without full rollout
+      - alert: CanaryStuckInRollout
+        expr: |
+          (time() - authorizer_info{deployment_role="canary"} offset 30m) > 0
+          AND authorizer_info{deployment_role="stable"}
+        for: 30m
+        labels:
+          severity: info
+          team: platform
+        annotations:
+          summary: "Canary deployment has been running > 30 minutes without completing"
+          description: |
+            The canary ({{ $labels.version }}) has been live for over 30 minutes.
+            Consider promoting to full rollout or rolling back if metrics are acceptable.

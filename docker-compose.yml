@@ -1,0 +1,187 @@
+version: "3.9"
+
+# =============================================================================
+# Transaction Authorizer - Zero-Downtime Deployment Stack
+# Simulates a canary deployment with: stable (v1), canary (v2), nginx load
+# balancer with weighted routing, Prometheus, and Grafana.
+# =============================================================================
+
+networks:
+  authorizer-net:
+    driver: bridge
+
+volumes:
+  prometheus_data:
+  grafana_data:
+
+# ── Secrets (Docker secrets substitute for Vault/K8s secrets in local demo) ──
+secrets:
+  stripe_api_key:
+    file: ./secrets/stripe_api_key.txt
+  db_connection_string:
+    file: ./secrets/db_connection_string.txt
+  encryption_key:
+    file: ./secrets/encryption_key.txt
+
+# =============================================================================
+services:
+
+  # ── STABLE instances (v1 - current production) ────────────────────────────
+  authorizer-v1-1:
+    build:
+      context: ./mock-service
+    image: transaction-authorizer:v1
+    container_name: authorizer-v1-1
+    environment:
+      SERVICE_VERSION: "v1.0.0"
+      STARTUP_DELAY_SECONDS: "5"
+      FAIL_RATE: "0.01"          # 1% error rate - healthy production
+    secrets:
+      - stripe_api_key
+      - db_connection_string
+      - encryption_key
+    networks:
+      - authorizer-net
+    restart: unless-stopped
+    labels:
+      deployment.version: "v1"
+      deployment.role: "stable"
+
+  authorizer-v1-2:
+    build:
+      context: ./mock-service
+    image: transaction-authorizer:v1
+    container_name: authorizer-v1-2
+    environment:
+      SERVICE_VERSION: "v1.0.0"
+      STARTUP_DELAY_SECONDS: "5"
+      FAIL_RATE: "0.01"
+    secrets:
+      - stripe_api_key
+      - db_connection_string
+      - encryption_key
+    networks:
+      - authorizer-net
+    restart: unless-stopped
+    labels:
+      deployment.version: "v1"
+      deployment.role: "stable"
+
+  authorizer-v1-3:
+    build:
+      context: ./mock-service
+    image: transaction-authorizer:v1
+    container_name: authorizer-v1-3
+    environment:
+      SERVICE_VERSION: "v1.0.0"
+      STARTUP_DELAY_SECONDS: "5"
+      FAIL_RATE: "0.01"
+    secrets:
+      - stripe_api_key
+      - db_connection_string
+      - encryption_key
+    networks:
+      - authorizer-net
+    restart: unless-stopped
+    labels:
+      deployment.version: "v1"
+      deployment.role: "stable"
+
+  # ── CANARY instance (v2 - new version being rolled out) ───────────────────
+  # To simulate a bad deployment, set FAIL_RATE: "0.8" (80% errors)
+  authorizer-v2-canary:
+    build:
+      context: ./mock-service
+    image: transaction-authorizer:v2
+    container_name: authorizer-v2-canary
+    environment:
+      SERVICE_VERSION: "v2.0.0"
+      STARTUP_DELAY_SECONDS: "8"   # Simulates slower startup of new version
+      FAIL_RATE: "0.02"            # Change to 0.8 to simulate Diwali incident
+    secrets:
+      - stripe_api_key
+      - db_connection_string
+      - encryption_key
+    networks:
+      - authorizer-net
+    restart: unless-stopped
+    labels:
+      deployment.version: "v2"
+      deployment.role: "canary"
+
+  # ── NGINX Load Balancer (weighted: 75% stable, 25% canary) ────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: authorizer-lb
+    ports:
+      - "8080:80"
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - authorizer-net
+    depends_on:
+      - authorizer-v1-1
+      - authorizer-v1-2
+      - authorizer-v1-3
+      - authorizer-v2-canary
+    restart: unless-stopped
+
+  # ── Prometheus ─────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.enable-lifecycle'
+    networks:
+      - authorizer-net
+    restart: unless-stopped
+
+  # ── Grafana ────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/var/lib/grafana/dashboards/authorizer.json"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+    networks:
+      - authorizer-net
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # ── Load Generator (simulates 5000 req/s scaled to demo) ──────────────────
+  load-generator:
+    image: alpine/curl:8.7.1
+    container_name: load-generator
+    networks:
+      - authorizer-net
+    depends_on:
+      - nginx
+    entrypoint: >
+      sh -c "
+        echo 'Waiting for services to start...';
+        sleep 20;
+        echo 'Starting load generation...';
+        while true; do
+          curl -s -X POST http://nginx/authorize \
+            -H 'Content-Type: application/json' \
+            -d '{\"amount\": 100, \"currency\": \"USD\", \"merchant_id\": \"merchant_001\"}' > /dev/null;
+          sleep 0.1;
+        done
+      "
+    restart: unless-stopped
