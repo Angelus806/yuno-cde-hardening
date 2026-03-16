@@ -1,0 +1,344 @@
+---
+# =============================================================================
+# Yuno CDE Cluster — NetworkPolicy Manifests
+# Strategy: Default-deny all, allowlist-based exceptions
+# Requirement: PCI-DSS 1.2.1 — Network segmentation between CDE and non-CDE
+# =============================================================================
+#
+# CDE Service Map:
+#   api-gateway          → tokenization-service:8443
+#   tokenization-service → vault-db:5432
+#   *                    → external payment APIs (egress HTTPS :443)
+#   prometheus           → *:9090 (metrics scraping)
+#   kubectl exec         → pod ephemeral containers (handled at API server level)
+#
+# Namespace labels required:
+#   cde namespace:         kubernetes.io/metadata.name: cde
+#   monitoring namespace:  kubernetes.io/metadata.name: monitoring
+# =============================================================================
+
+# ----------------------------------------------------------------------------
+# 0. Namespace Setup — Label the CDE namespace
+#    Apply: kubectl label namespace cde pci-scope=cde environment=production
+# ----------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cde
+  labels:
+    pci-scope: cde
+    environment: production
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+
+---
+# ----------------------------------------------------------------------------
+# 1. DEFAULT DENY ALL — Ingress + Egress
+#    This is the foundation. Every other policy is an additive exception.
+#    Without this, Kubernetes allows all pod-to-pod communication by default
+#    (the "flat network" that enabled lateral movement in the pentest).
+#    PCI-DSS: Requirement 1.2.1
+# ----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: cde
+  annotations:
+    policy.yuno.com/description: >
+      Default-deny all ingress and egress traffic for the CDE namespace.
+      All permitted communication must be explicitly defined in subsequent
+      NetworkPolicy objects. This implements the "deny all, permit by exception"
+      model required for PCI-DSS network segmentation.
+    policy.yuno.com/pci-req: "1.2.1"
+spec:
+  podSelector: {}   # Selects ALL pods in the cde namespace
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# ----------------------------------------------------------------------------
+# 2. API Gateway — Ingress from external (HTTPS) + Egress to tokenization
+#    The api-gateway is the only public-facing service. It receives HTTPS
+#    traffic from outside the cluster and forwards to the tokenization service.
+#    PCI-DSS: Requirement 1.2.1 — Restrict inbound/outbound traffic to CDE
+# ----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-gateway-policy
+  namespace: cde
+  annotations:
+    policy.yuno.com/description: >
+      Controls traffic for the API Gateway. Allows inbound HTTPS from the
+      ingress controller namespace and outbound to the tokenization service
+      only. All other traffic is blocked by the default-deny policy.
+    policy.yuno.com/pci-req: "1.2.1"
+spec:
+  podSelector:
+    matchLabels:
+      app: api-gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow HTTPS from the ingress-nginx controller namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # Allow outbound to tokenization service on port 8443
+    - to:
+        - podSelector:
+            matchLabels:
+              app: tokenization-service
+      ports:
+        - protocol: TCP
+          port: 8443
+    # Allow DNS resolution (required for all pods to resolve service names)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# ----------------------------------------------------------------------------
+# 3. Tokenization Service — Only from API Gateway, only to Vault DB
+#    This is the most critical policy. The pentest showed a compromised pod
+#    could connect directly to the tokenization DB. This policy ensures ONLY
+#    the tokenization service itself can reach the database.
+#    PCI-DSS: Requirement 1.2.1 + 3.4 (protect CHD access paths)
+# ----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tokenization-service-policy
+  namespace: cde
+  annotations:
+    policy.yuno.com/description: >
+      Strictly controls the tokenization service — the most sensitive component
+      of the CDE. It may only receive traffic from the api-gateway and may only
+      reach the vault-db. This prevents the lateral movement demonstrated in
+      the pentest where a compromised payment-gateway pod connected directly to
+      the tokenization database.
+    policy.yuno.com/pci-req: "1.2.1, 3.4"
+spec:
+  podSelector:
+    matchLabels:
+      app: tokenization-service
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # ONLY accept traffic from the API Gateway pod
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+      ports:
+        - protocol: TCP
+          port: 8443
+  egress:
+    # ONLY allow outbound to vault-db on PostgreSQL port
+    - to:
+        - podSelector:
+            matchLabels:
+              app: vault-db
+      ports:
+        - protocol: TCP
+          port: 5432
+    # DNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# ----------------------------------------------------------------------------
+# 4. Vault DB — Ingress ONLY from tokenization-service
+#    PCI-DSS: Requirement 1.2.1 + 7.1 (limit access to CHD)
+# ----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vault-db-policy
+  namespace: cde
+  annotations:
+    policy.yuno.com/description: >
+      The cardholder data vault database accepts connections ONLY from the
+      tokenization service. No other pod in any namespace may reach this
+      database. Egress from the DB pod is fully blocked.
+    policy.yuno.com/pci-req: "1.2.1, 7.1"
+spec:
+  podSelector:
+    matchLabels:
+      app: vault-db
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: tokenization-service
+      ports:
+        - protocol: TCP
+          port: 5432
+  # Egress: fully blocked by default-deny-all. DB has no outbound traffic needs.
+
+---
+# ----------------------------------------------------------------------------
+# 5. Payment Gateway — Egress to external payment providers (HTTPS)
+#    Trade-off decision: We allow egress to :443 for all external IPs.
+#    Fully locking to specific IP ranges is fragile (Stripe/Adyen use CDNs
+#    with dynamic IPs). The monitoring + Falco layer detects unexpected destinations.
+#    PCI-DSS: Requirement 1.2.1 — Document allowed external traffic
+# ----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payment-gateway-egress-external
+  namespace: cde
+  annotations:
+    policy.yuno.com/description: >
+      Allows the payment-gateway to make outbound HTTPS calls to external
+      payment providers (Stripe, Adyen, Mercado Pago, etc.).
+      TRADE-OFF: We cannot restrict by destination IP because payment providers
+      use dynamic CDN IPs. Instead, we restrict to port 443 (HTTPS only) and
+      rely on Falco runtime rules to alert on connections to unexpected hosts.
+      A future improvement is egress through a proxy with domain-allowlisting.
+    policy.yuno.com/pci-req: "1.2.1"
+    policy.yuno.com/review-date: "2025-06-01"
+spec:
+  podSelector:
+    matchLabels:
+      app: payment-gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Accept from API gateway only
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # Allow HTTPS to payment providers
+    - ports:
+        - protocol: TCP
+          port: 443
+    # DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# ----------------------------------------------------------------------------
+# 6. Prometheus Metrics Scraping — Ingress from monitoring namespace
+#    All CDE pods must expose :9090 metrics, accessible only to Prometheus.
+#    PCI-DSS: Requirement 10.2 — Log and monitor all access
+# ----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-metrics-scraping
+  namespace: cde
+  annotations:
+    policy.yuno.com/description: >
+      Allows Prometheus in the monitoring namespace to scrape metrics from
+      all CDE pods on port 9090. This enables PCI-DSS requirement 10 compliance
+      (monitoring and logging). Prometheus must run in the 'monitoring' namespace
+      with label app=prometheus.
+    policy.yuno.com/pci-req: "10.2"
+spec:
+  podSelector: {}   # Apply to all pods in the CDE namespace
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app: prometheus
+      ports:
+        - protocol: TCP
+          port: 9090
+
+---
+# ----------------------------------------------------------------------------
+# 7. DNS Allow — All CDE pods need DNS resolution
+#    Without this, service discovery and external calls will fail silently.
+# ----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: cde
+  annotations:
+    policy.yuno.com/description: >
+      Permits all CDE pods to reach kube-dns for service name resolution.
+      This is required for Kubernetes service discovery. Without it, pods
+      cannot resolve internal service names or external hostnames.
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# ----------------------------------------------------------------------------
+# DEVELOPER EXPERIENCE TRADE-OFF DOCUMENTATION
+# ----------------------------------------------------------------------------
+# kubectl exec:
+#   `kubectl exec` operates through the Kubernetes API Server, not directly
+#   through pod-to-pod networking. It does NOT require NetworkPolicy rules.
+#   Developers can still kubectl exec into CDE pods for debugging as long as
+#   they have the appropriate RBAC permissions (exec verb on pods/exec subresource).
+#
+#   Control: Restrict kubectl exec via RBAC — developers get exec access in
+#   DV/IN namespaces; production CDE exec requires a separate privileged role
+#   that generates an audit log entry (satisfying PCI-DSS Requirement 10.2).
+#
+# Egress restriction trade-off:
+#   Full IP-based egress restrictions for payment provider APIs are impractical
+#   due to CDN-based dynamic IPs. Our mitigation layers are:
+#   1. Port restriction: egress allowed only on :443 (HTTPS)
+#   2. Falco: runtime alerts for unexpected outbound destinations
+#   3. Future: egress proxy (Squid/Envoy) with domain-allowlist for providers
+# ----------------------------------------------------------------------------

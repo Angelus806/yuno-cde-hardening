@@ -1,0 +1,235 @@
+---
+# =============================================================================
+# Yuno CDE Cluster — Image Supply Chain Security
+# Tools: Cosign (Sigstore) for signing + Kyverno for admission verification
+# Requirement: PCI-DSS 6.3 — Protect against known vulnerabilities
+# Stretch Goal #5: Image Supply Chain Security
+# =============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Kyverno Policy — Verify Image Signatures (Cosign/Sigstore)
+#    Blocks any image that hasn't been signed by Yuno's CI/CD pipeline.
+#    This prevents:
+#      - Unreviewed developer images deployed to production
+#      - Compromised base images from third-party registries
+#      - Images from forks/PRs that bypassed the security pipeline
+#    PCI-DSS: Requirement 6.3.3 — All software components protected from
+#    known vulnerabilities via patch management
+# ----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signatures
+  annotations:
+    policies.kyverno.io/title: Verify Container Image Signatures
+    policies.kyverno.io/category: Supply Chain Security - CDE
+    policies.kyverno.io/severity: critical
+    policies.kyverno.io/description: >
+      All container images deployed to the CDE namespace must be signed using
+      Cosign with Yuno's CI/CD signing key. Images without a valid signature
+      are rejected at admission. The public key is stored as a Kubernetes Secret
+      and rotated quarterly per PCI-DSS key management requirements.
+spec:
+  validationFailureAction: Enforce
+  background: false       # Don't check existing pods — only new admissions
+  webhookTimeoutSeconds: 30
+  rules:
+    - name: verify-cosign-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [cde, payment-services]
+      verifyImages:
+        - imageReferences:
+            - "*.azurecr.io/yuno/*"          # Azure Container Registry (primary)
+            - "ghcr.io/yuno-payments/*"       # GitHub Container Registry (CI)
+          attestors:
+            - count: 1   # At least 1 attestor must verify
+              entries:
+                - keys:
+                    # Yuno CI/CD signing public key (cosign.pub)
+                    # Rotate this key quarterly per PCI-DSS key management requirements
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      # REPLACE WITH ACTUAL cosign.pub CONTENT
+                      # Generate with: cosign generate-key-pair
+                      # Store private key in Vault: vault kv put secret/cosign/private key=@cosign.key
+                      -----END PUBLIC KEY-----
+                    signatureAlgorithm: sha256
+          mutateDigest: true    # Replace tags with digest for immutability (tag mutability attack)
+          verifyDigest: true
+          required: true
+
+---
+# ----------------------------------------------------------------------------
+# 2. Kyverno Policy — Block Images from Untrusted Registries
+#    Only images from Yuno's own registries are permitted in the CDE.
+#    Blocks: Docker Hub, random public registries, unverified sources.
+#    PCI-DSS: Requirement 6.3 — Protect against known vulnerabilities
+# ----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-image-registries
+  annotations:
+    policies.kyverno.io/title: Restrict to Trusted Image Registries
+    policies.kyverno.io/category: Supply Chain Security - CDE
+    policies.kyverno.io/severity: high
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: trusted-registries-only
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [cde, payment-services]
+      validate:
+        message: >
+          Images in the CDE namespace must come from Yuno's trusted registries:
+          - *.azurecr.io/yuno/* (Azure Container Registry)
+          - ghcr.io/yuno-payments/* (GitHub Container Registry)
+          Docker Hub, quay.io, and other public registries are not permitted.
+        pattern:
+          spec:
+            containers:
+              - image: "*.azurecr.io/yuno/* | ghcr.io/yuno-payments/*"
+            =(initContainers):
+              - image: "*.azurecr.io/yuno/* | ghcr.io/yuno-payments/*"
+
+---
+# ----------------------------------------------------------------------------
+# 3. Kyverno Policy — Block Images with Latest Tag
+#    Using 'latest' tag breaks image immutability and reproducibility.
+#    All CDE deployments must use specific version tags or digest references.
+#    PCI-DSS: Requirement 6.3.3 — Controlled patch management
+# ----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: block-latest-tag
+  annotations:
+    policies.kyverno.io/title: Block Latest Tag in CDE
+    policies.kyverno.io/category: Supply Chain Security - CDE
+    policies.kyverno.io/severity: medium
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: block-latest-or-no-tag
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [cde, payment-services]
+      validate:
+        message: >
+          Container images must not use the 'latest' tag or be referenced without
+          a tag. Use a specific version tag (e.g., :v1.2.3) or SHA digest
+          (e.g., @sha256:abc123...) for all CDE deployments.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.containers[].image }}"
+                operator: AnyIn
+                value:
+                  - "*:latest"
+                  - "*/latest"
+              - key: >
+                  {{ request.object.spec.containers[].image |
+                  map(&contains(@, ':'), @) | contains(@, `false`) }}
+                operator: Equals
+                value: true
+
+---
+# ----------------------------------------------------------------------------
+# 4. GitHub Actions CI Pipeline — Build, Scan, Sign, Push
+#    This is the CI/CD pipeline that produces signed, scanned images.
+#    Save as: .github/workflows/build-cde-image.yml
+# ----------------------------------------------------------------------------
+# (This section documents the GitHub Actions workflow as YAML comments
+#  since it's a different file format — see the CI pipeline file)
+#
+# Pipeline stages:
+#   1. Build image from Dockerfile
+#   2. Scan with Trivy for HIGH/CRITICAL CVEs → fail pipeline if found
+#   3. Sign image with Cosign using the private key stored in GitHub Secrets
+#   4. Generate and attest SBOM (Software Bill of Materials)
+#   5. Push to ACR with version tag (not latest)
+#
+# Trivy scan step (blocks HIGH/CRITICAL CVEs):
+#   - name: Scan image for vulnerabilities
+#     uses: aquasecurity/trivy-action@master
+#     with:
+#       image-ref: '${{ env.REGISTRY }}/yuno/${{ env.IMAGE_NAME }}:${{ env.VERSION }}'
+#       format: 'table'
+#       exit-code: '1'              # Fail the pipeline
+#       ignore-unfixed: true
+#       vuln-type: 'os,library'
+#       severity: 'HIGH,CRITICAL'   # Block on HIGH and CRITICAL only
+#
+# Cosign signing step:
+#   - name: Sign image with Cosign
+#     env:
+#       COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+#       COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+#     run: |
+#       cosign sign --key env://COSIGN_PRIVATE_KEY \
+#         ${{ env.REGISTRY }}/yuno/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+#
+# SBOM generation and attestation:
+#   - name: Generate SBOM
+#     uses: anchore/sbom-action@v0
+#     with:
+#       image: '${{ env.REGISTRY }}/yuno/${{ env.IMAGE_NAME }}:${{ env.VERSION }}'
+#       format: spdx-json
+#   - name: Attest SBOM
+#     run: |
+#       cosign attest --predicate sbom.spdx.json \
+#         --key env://COSIGN_PRIVATE_KEY \
+#         ${{ env.REGISTRY }}/yuno/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+
+---
+# ----------------------------------------------------------------------------
+# 5. Kyverno Policy — Require SBOM Attestation
+#    Blocks images that don't have an attached SBOM attestation.
+#    Enables full software inventory for PCI-DSS audits.
+# ----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-sbom-attestation
+  annotations:
+    policies.kyverno.io/title: Require SBOM Attestation
+    policies.kyverno.io/category: Supply Chain Security - CDE
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >
+      All images in the CDE namespace must have an SBOM attestation signed
+      by the Yuno CI/CD pipeline. The SBOM provides a complete inventory of
+      software components for PCI-DSS audit purposes and vulnerability tracking.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: require-sbom
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [cde, payment-services]
+      verifyImages:
+        - imageReferences:
+            - "*.azurecr.io/yuno/*"
+            - "ghcr.io/yuno-payments/*"
+          attestations:
+            - predicateType: https://spdx.dev/Document
+              attestors:
+                - count: 1
+                  entries:
+                    - keys:
+                        publicKeys: |-
+                          -----BEGIN PUBLIC KEY-----
+                          # REPLACE WITH ACTUAL cosign.pub CONTENT
+                          -----END PUBLIC KEY-----

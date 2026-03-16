@@ -1,0 +1,244 @@
+# =============================================================================
+# Yuno CDE Cluster — Falco Runtime Security Rules
+# Requirement: PCI-DSS 10.2 — Log all access to cardholder data
+# Stretch Goal #4: Runtime Security Monitoring
+#
+# Install: helm repo add falcosecurity https://falcosecurity.github.io/charts
+#          helm install falco falcosecurity/falco -n falco --create-namespace \
+#            -f falco-values.yaml
+# =============================================================================
+
+# falco-values.yaml (Helm values for Falco installation)
+# ---------------------------------------------------------
+# falco:
+#   grpc:
+#     enabled: true
+#   grpcOutput:
+#     enabled: true
+#   jsonOutput: true
+#   jsonIncludeOutputProperty: true
+#   rulesFile:
+#     - /etc/falco/falco_rules.yaml
+#     - /etc/falco/falco_rules.local.yaml
+#     - /etc/falco/yuno_cde_rules.yaml
+# falcosidekick:
+#   enabled: true
+#   config:
+#     slack:
+#       webhookurl: "https://hooks.slack.com/services/XXXXX"
+#       channel: "#security-incidents"
+#       minimumpriority: "warning"
+#     pagerduty:
+#       routingKey: "XXXXX"
+#       minimumpriority: "critical"
+
+---
+# Custom Falco rules for Yuno CDE
+# Apply as ConfigMap to the Falco DaemonSet
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: falco-cde-rules
+  namespace: falco
+data:
+  yuno_cde_rules.yaml: |
+    # =========================================================================
+    # Yuno CDE — Custom Falco Security Rules
+    # =========================================================================
+
+    # -------------------------------------------------------------------------
+    # Macros — Reusable conditions
+    # -------------------------------------------------------------------------
+    - macro: cde_namespace
+      condition: k8s.ns.name in (cde, payment-services)
+
+    - macro: payment_containers
+      condition: >
+        container.name in (payment-gateway, tokenization-service, vault-db, api-gateway)
+
+    - macro: expected_binaries
+      condition: >
+        proc.name in (java, node, python3, python, go, sh, bash, curl, wget,
+                      postgres, pg_ctl, vault, java)
+
+    - macro: sensitive_file_paths
+      condition: >
+        fd.name startswith /etc/shadow or
+        fd.name startswith /etc/passwd or
+        fd.name startswith /proc/self/mem or
+        fd.name startswith /var/run/secrets/kubernetes.io or
+        fd.name startswith /run/secrets or
+        fd.name contains id_rsa or
+        fd.name contains .aws/credentials or
+        fd.name endswith .pem or
+        fd.name endswith .key
+
+    # -------------------------------------------------------------------------
+    # Rule 1: Unexpected shell spawned in payment container
+    #   Detects: Attacker spawning /bin/sh or /bin/bash in a Java/Node service
+    #   PCI-DSS: Requirement 10.2.1 — All individual user access to CHD
+    # -------------------------------------------------------------------------
+    - rule: Shell Spawned in CDE Payment Container
+      desc: >
+        A shell was spawned inside a CDE payment container. Payment services
+        (Java, Node.js) should never spawn interactive shells during normal
+        operation. This may indicate a container escape attempt or RCE exploit.
+      condition: >
+        cde_namespace and
+        spawned_process and
+        container and
+        shell_procs and
+        not proc.pname in (java, node, python3)
+      output: >
+        CRITICAL Shell spawned in CDE container
+        (user=%user.name container=%container.name image=%container.image.repository
+        shell=%proc.name parent=%proc.pname cmdline=%proc.cmdline
+        pod=%k8s.pod.name ns=%k8s.ns.name)
+      priority: CRITICAL
+      tags: [cde, pci-dss, container-escape, T1059]
+
+    # -------------------------------------------------------------------------
+    # Rule 2: Sensitive file access in payment container
+    #   Detects: Reading /etc/shadow, SSH keys, or Kubernetes service account tokens
+    #   PCI-DSS: Requirement 10.2.4 — Invalid logical access attempts
+    # -------------------------------------------------------------------------
+    - rule: Sensitive File Access in CDE Container
+      desc: >
+        A process in a CDE container attempted to read a sensitive file.
+        Payment services should not access system credential files or
+        Kubernetes service account tokens directly.
+      condition: >
+        cde_namespace and
+        container and
+        open_read and
+        sensitive_file_paths and
+        not proc.name in (vault-agent, external-secrets)
+      output: >
+        WARNING Sensitive file accessed in CDE container
+        (user=%user.name proc=%proc.name file=%fd.name
+        container=%container.name pod=%k8s.pod.name ns=%k8s.ns.name
+        image=%container.image.repository)
+      priority: WARNING
+      tags: [cde, pci-dss, credential-access, T1552]
+
+    # -------------------------------------------------------------------------
+    # Rule 3: Unexpected outbound network connection
+    #   Detects: Payment gateway connecting to unexpected destinations
+    #   Complements NetworkPolicy (policy enforces known-good; Falco detects anomalies)
+    #   PCI-DSS: Requirement 10.2.6 — Initialization/halt of audit logs
+    # -------------------------------------------------------------------------
+    - rule: Unexpected Outbound Connection from CDE Pod
+      desc: >
+        A CDE container established a network connection to an unexpected
+        destination. This may indicate data exfiltration or C2 communication.
+        Expected destinations: Stripe (api.stripe.com), Adyen, Mercado Pago APIs.
+      condition: >
+        cde_namespace and
+        container and
+        outbound and
+        not fd.sip.name in (
+          "api.stripe.com",
+          "api.adyen.com",
+          "api.mercadopago.com",
+          "vault.internal.yuno.com"
+        ) and
+        not fd.sport in (53, 443) and
+        not fd.dport in (5432, 8443, 9090, 53)
+      output: >
+        WARNING Unexpected outbound connection from CDE container
+        (proc=%proc.name container=%container.name destination=%fd.rip
+        dest_port=%fd.rport proto=%fd.proto pod=%k8s.pod.name ns=%k8s.ns.name)
+      priority: WARNING
+      tags: [cde, pci-dss, exfiltration, T1041]
+
+    # -------------------------------------------------------------------------
+    # Rule 4: Privilege escalation attempt
+    #   Detects: setuid/setgid calls or capability manipulation
+    #   PCI-DSS: Requirement 10.2.5 — Use of / changes to identification mechanisms
+    # -------------------------------------------------------------------------
+    - rule: Privilege Escalation Attempt in CDE
+      desc: >
+        A process in a CDE container attempted privilege escalation via
+        setuid, setgid, or capability manipulation. This is a strong indicator
+        of an active container escape or lateral movement attempt.
+      condition: >
+        cde_namespace and
+        container and
+        (syscall.type = setuid or
+         syscall.type = setgid or
+         evt.type = capset) and
+        not user.uid = 0
+      output: >
+        CRITICAL Privilege escalation attempt in CDE container
+        (user=%user.name uid=%user.uid proc=%proc.name syscall=%syscall.type
+        container=%container.name pod=%k8s.pod.name ns=%k8s.ns.name)
+      priority: CRITICAL
+      tags: [cde, pci-dss, privilege-escalation, T1548]
+
+    # -------------------------------------------------------------------------
+    # Rule 5: Container namespace escape indicators
+    #   Detects: Mount syscalls or /proc/PID/ns access (escape primitives)
+    #   PCI-DSS: Requirement 10.2 — Implement audit logs
+    # -------------------------------------------------------------------------
+    - rule: Container Escape Indicator in CDE
+      desc: >
+        A CDE container accessed namespace files or attempted to mount filesystems.
+        These are common techniques used during container escape attacks, such as
+        runc escapes or kernel exploits leveraging /proc/self/exe.
+      condition: >
+        cde_namespace and
+        container and
+        (fd.name startswith /proc and fd.name contains /ns/ or
+         evt.type = mount or
+         proc.name = nsenter)
+      output: >
+        CRITICAL Container escape indicator detected
+        (proc=%proc.name file=%fd.name container=%container.name
+        pod=%k8s.pod.name ns=%k8s.ns.name cmdline=%proc.cmdline)
+      priority: CRITICAL
+      tags: [cde, pci-dss, container-escape, T1611]
+
+    # -------------------------------------------------------------------------
+    # Rule 6: Database credential file access outside normal query pattern
+    #   Detects: Any process other than the DB driver reading credential files
+    # -------------------------------------------------------------------------
+    - rule: Payment Credential File Access by Unexpected Process
+      desc: >
+        A credential file (as mounted from ESO Secrets) was accessed by a
+        process other than the expected application. This may indicate a
+        compromised container attempting to steal payment API keys.
+      condition: >
+        cde_namespace and
+        container and
+        open_read and
+        (fd.name startswith /secrets/ or fd.name startswith /var/secrets/) and
+        not proc.name in (java, node, python3, python, payment-gateway,
+                          tokenization-service, vault-agent)
+      output: >
+        CRITICAL Credential file accessed by unexpected process in CDE
+        (proc=%proc.name file=%fd.name user=%user.name
+        container=%container.name pod=%k8s.pod.name)
+      priority: CRITICAL
+      tags: [cde, pci-dss, credential-access, T1552.001]
+
+    # -------------------------------------------------------------------------
+    # Rule 7: Cryptominer / unexpected compute-intensive process
+    #   Detects: Common cryptominer binary names (supply chain attack indicator)
+    # -------------------------------------------------------------------------
+    - rule: Cryptominer Detected in CDE Container
+      desc: >
+        A process matching known cryptominer patterns was detected in a CDE
+        container. This may indicate a supply chain attack via a compromised
+        base image or a lateral movement payload.
+      condition: >
+        cde_namespace and
+        container and
+        spawned_process and
+        proc.name in (xmrig, minerd, cpuminer, ethminer, t-rex, nbminer,
+                      lolminer, cgminer, bfgminer)
+      output: >
+        CRITICAL Cryptominer process detected in CDE container
+        (proc=%proc.name container=%container.name pod=%k8s.pod.name
+        image=%container.image.repository)
+      priority: CRITICAL
+      tags: [cde, pci-dss, impact, T1496]

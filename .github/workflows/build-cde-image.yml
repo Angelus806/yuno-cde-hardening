@@ -1,0 +1,240 @@
+name: Build, Scan & Sign CDE Image
+
+# =============================================================================
+# Yuno CDE — CI/CD Pipeline
+# Stages:
+#   1. Build Docker image
+#   2. Scan for HIGH/CRITICAL CVEs with Trivy (blocks pipeline if found)
+#   3. Sign image with Cosign (Sigstore)
+#   4. Generate and attest SBOM
+#   5. Push signed image to registry
+#
+# Required GitHub Secrets:
+#   REGISTRY_LOGIN_SERVER  — e.g. yunopayments.azurecr.io
+#   REGISTRY_USERNAME      — ACR service principal client ID
+#   REGISTRY_PASSWORD      — ACR service principal client secret
+#   COSIGN_PRIVATE_KEY     — output of: cosign generate-key-pair (cosign.key contents)
+#   COSIGN_PASSWORD        — passphrase used when generating the key pair
+# =============================================================================
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'services/**'
+      - '.github/workflows/build-cde-image.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'services/**'
+
+env:
+  REGISTRY: ${{ secrets.REGISTRY_LOGIN_SERVER }}
+  IMAGE_NAME: payment-gateway
+  # Version tag: uses the short Git SHA for immutability
+  # e.g. payment-gateway:sha-a1b2c3d
+  VERSION: sha-${{ github.sha }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # JOB 1: Build
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-ref: ${{ env.REGISTRY }}/yuno/${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/${{ env.IMAGE_NAME }}
+          push: true
+          # Use digest reference for immutability — never rely on mutable tags
+          tags: |
+            ${{ env.REGISTRY }}/yuno/${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+          # Do NOT push :latest tag — blocked by Kyverno policy in CDE
+          labels: |
+            org.opencontainers.image.source=${{ github.repositoryUrl }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Output the image digest for use in signing step
+          outputs: type=image,push=true
+
+  # ---------------------------------------------------------------------------
+  # JOB 2: Vulnerability Scan with Trivy
+  # Blocks the pipeline if HIGH or CRITICAL CVEs are found.
+  # PCI-DSS: Requirement 6.3.3 — All software protected from known vulnerabilities
+  # ---------------------------------------------------------------------------
+  scan:
+    name: Vulnerability Scan (Trivy)
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      security-events: write   # Required to upload SARIF to GitHub Security tab
+
+    steps:
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Scan image for OS and library vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build.outputs.image-ref }}
+          format: sarif
+          output: trivy-results.sarif
+          # CRITICAL: exit-code 1 fails the pipeline — blocks deploy if HIGH/CRITICAL found
+          exit-code: '1'
+          ignore-unfixed: true        # Don't fail on CVEs with no fix available yet
+          vuln-type: 'os,library'
+          severity: 'HIGH,CRITICAL'   # Block on HIGH and CRITICAL only (LOW/MEDIUM logged)
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()   # Upload results even if scan failed (for visibility)
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-cde-image
+
+      - name: Full vulnerability report (table format, all severities)
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build.outputs.image-ref }}
+          format: table
+          exit-code: '0'             # Don't fail here — just for human-readable output
+          vuln-type: 'os,library'
+          severity: 'LOW,MEDIUM,HIGH,CRITICAL'
+
+  # ---------------------------------------------------------------------------
+  # JOB 3: Sign Image with Cosign + Generate SBOM Attestation
+  # PCI-DSS: Requirement 6.3 — Software integrity verification
+  # Kyverno policy verify-image-signatures will block unsigned images in CDE
+  # ---------------------------------------------------------------------------
+  sign-and-attest:
+    name: Sign & Attest (Cosign)
+    runs-on: ubuntu-latest
+    needs: [build, scan]   # Only sign if build succeeded AND scan passed
+    permissions:
+      contents: read
+      id-token: write      # Required for keyless signing (OIDC) — used as fallback
+
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.2.3'
+
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Sign image with Cosign (key-based)
+        # Signs using the private key stored in GitHub Secrets.
+        # The corresponding public key (cosign.pub) is embedded in the
+        # Kyverno verify-image-signatures policy in the CDE cluster.
+        # Any image without a valid signature from this key is blocked at admission.
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.image-digest }}
+        run: |
+          cosign sign --yes \
+            --key env://COSIGN_PRIVATE_KEY \
+            "${{ env.REGISTRY }}/yuno/${{ env.IMAGE_NAME }}@${IMAGE_DIGEST}"
+          
+          echo "✅ Image signed: ${{ env.REGISTRY }}/yuno/${{ env.IMAGE_NAME }}@${IMAGE_DIGEST}"
+
+      - name: Install Syft (SBOM generator)
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Generate SBOM (SPDX format)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ needs.build.outputs.image-ref }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          # SBOM provides a complete software inventory for PCI-DSS audit evidence
+          # QSA auditors can use this to verify no vulnerable components are present
+
+      - name: Attest SBOM with Cosign
+        # Attaches the SBOM as a signed attestation to the image in the registry.
+        # Kyverno policy require-sbom-attestation verifies this before allowing
+        # the image to run in the CDE namespace.
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.image-digest }}
+        run: |
+          cosign attest --yes \
+            --key env://COSIGN_PRIVATE_KEY \
+            --predicate sbom.spdx.json \
+            --type spdxjson \
+            "${{ env.REGISTRY }}/yuno/${{ env.IMAGE_NAME }}@${IMAGE_DIGEST}"
+          
+          echo "✅ SBOM attested for: ${{ env.REGISTRY }}/yuno/${{ env.IMAGE_NAME }}@${IMAGE_DIGEST}"
+
+      - name: Upload SBOM as pipeline artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.spdx.json
+          retention-days: 90   # Keep for PCI-DSS audit trail (90 days minimum)
+
+  # ---------------------------------------------------------------------------
+  # JOB 4: Summary — Print final image reference for deployment
+  # ---------------------------------------------------------------------------
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [build, scan, sign-and-attest]
+    if: success()
+
+    steps:
+      - name: Print signed image reference
+        run: |
+          echo "## ✅ CDE Image Ready for Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ needs.build.outputs.image-ref }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Digest | \`${{ needs.build.outputs.image-digest }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trivy Scan | ✅ No HIGH/CRITICAL CVEs |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cosign Signature | ✅ Signed with CDE key |" >> $GITHUB_STEP_SUMMARY
+          echo "| SBOM Attestation | ✅ Attached |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deploy to CDE" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "kubectl set image deployment/payment-gateway \\" >> $GITHUB_STEP_SUMMARY
+          echo "  payment-gateway=${{ needs.build.outputs.image-ref }} \\" >> $GITHUB_STEP_SUMMARY
+          echo "  -n cde" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

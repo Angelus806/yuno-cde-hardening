@@ -1,0 +1,340 @@
+---
+# =============================================================================
+# Yuno CDE Cluster — Kyverno Admission Control Policies
+# Requirement: PCI-DSS 2.2 (Harden system configurations, least-privilege)
+# =============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. Block Privileged Containers
+#    Addresses: Container escape vector from pentest (CAP_SYS_ADMIN abuse)
+#    PCI-DSS: Requirement 2.2.1 — Disable unnecessary services/features
+# ----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: block-privileged-containers
+  annotations:
+    policies.kyverno.io/title: Block Privileged Containers
+    policies.kyverno.io/category: Pod Security - CDE
+    policies.kyverno.io/severity: critical
+    policies.kyverno.io/description: >
+      Prevents containers from running in privileged mode. Privileged containers
+      have near-root access to the host kernel and were the initial escape vector
+      identified in the pentest. This policy blocks any pod with privileged: true
+      in any container or initContainer.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: block-privileged-containers
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [cde, payment-services]
+      validate:
+        message: >
+          Privileged containers are prohibited in the CDE namespace.
+          Remove `securityContext.privileged: true` from your pod spec.
+          If your workload requires elevated capabilities, request an exception
+          via the security team and use a targeted capability instead.
+        pattern:
+          spec:
+            containers:
+              - =(securityContext):
+                  =(privileged): "false"
+            =(initContainers):
+              - =(securityContext):
+                  =(privileged): "false"
+
+---
+# ----------------------------------------------------------------------------
+# 2. Block Host Namespace Sharing
+#    Addresses: Node pivot after container escape (hostPID, hostIPC, hostNetwork)
+#    PCI-DSS: Requirement 1.2.1 — Network segmentation
+# ----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: block-host-namespaces
+  annotations:
+    policies.kyverno.io/title: Block Host Namespace Sharing
+    policies.kyverno.io/category: Pod Security - CDE
+    policies.kyverno.io/severity: critical
+    policies.kyverno.io/description: >
+      Prevents pods from sharing host PID, IPC, or network namespaces.
+      Sharing host namespaces allows a compromised pod to inspect all processes
+      on the node (hostPID), manipulate inter-process communication (hostIPC),
+      or bypass NetworkPolicy entirely (hostNetwork).
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: block-host-namespaces
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [cde, payment-services]
+      validate:
+        message: >
+          Host namespace sharing (hostPID, hostIPC, hostNetwork) is prohibited
+          in the CDE namespace. These settings allow bypassing network policies
+          and inspecting host processes.
+        pattern:
+          spec:
+            =(hostPID): "false"
+            =(hostIPC): "false"
+            =(hostNetwork): "false"
+
+---
+# ----------------------------------------------------------------------------
+# 3. Block hostPath Volumes
+#    Addresses: Direct host filesystem access (credential exfiltration)
+#    PCI-DSS: Requirement 7.1 — Limit access based on need-to-know
+# ----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: block-hostpath-volumes
+  annotations:
+    policies.kyverno.io/title: Block hostPath Volume Mounts
+    policies.kyverno.io/category: Pod Security - CDE
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/description: >
+      Prevents pods from mounting host filesystem paths. hostPath mounts allow
+      reading sensitive host files (/etc/shadow, kubelet credentials, container
+      runtime sockets) that can be used for privilege escalation or credential theft.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: block-hostpath
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [cde, payment-services]
+      validate:
+        message: >
+          hostPath volume mounts are prohibited in the CDE namespace.
+          Use emptyDir, ConfigMap, Secret, or PersistentVolumeClaim instead.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.volumes[].hostPath | length(@) }}"
+                operator: GreaterThan
+                value: "0"
+
+---
+# ----------------------------------------------------------------------------
+# 4. Require Drop All Capabilities + Deny Privilege Escalation
+#    Addresses: CAP_SYS_ADMIN / CAP_NET_ADMIN abuse (initial escape vector)
+#    PCI-DSS: Requirement 2.2 — Least privilege
+# ----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-drop-all-capabilities
+  annotations:
+    policies.kyverno.io/title: Require Drop ALL Linux Capabilities
+    policies.kyverno.io/category: Pod Security - CDE
+    policies.kyverno.io/severity: critical
+    policies.kyverno.io/description: >
+      All containers must explicitly drop ALL Linux capabilities. Capabilities
+      may be selectively re-added only via approved exception policies.
+      This prevents the CAP_SYS_ADMIN and CAP_NET_ADMIN abuse that enabled
+      the container escape in the pentest report.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: drop-all-capabilities
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [cde, payment-services]
+      validate:
+        message: >
+          All containers must have `securityContext.capabilities.drop: [ALL]`
+          and `allowPrivilegeEscalation: false`. Add specific capabilities back
+          only if strictly required, via an approved exception policy.
+        pattern:
+          spec:
+            containers:
+              - securityContext:
+                  allowPrivilegeEscalation: "false"
+                  capabilities:
+                    drop:
+                      - ALL
+            =(initContainers):
+              - securityContext:
+                  allowPrivilegeEscalation: "false"
+                  capabilities:
+                    drop:
+                      - ALL
+
+---
+# ----------------------------------------------------------------------------
+# 5. Require Non-Root User
+#    Addresses: Root process lateral movement after escape
+#    PCI-DSS: Requirement 2.2 — Least privilege
+# ----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-non-root-user
+  annotations:
+    policies.kyverno.io/title: Require Non-Root Container User
+    policies.kyverno.io/category: Pod Security - CDE
+    policies.kyverno.io/severity: high
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-non-root
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [cde, payment-services]
+      validate:
+        message: >
+          Containers must not run as root. Set `securityContext.runAsNonRoot: true`
+          and `runAsUser` to a UID >= 1000. This limits the impact of a container
+          escape to a non-privileged user on the host.
+        pattern:
+          spec:
+            securityContext:
+              runAsNonRoot: "true"
+            containers:
+              - securityContext:
+                  runAsNonRoot: "true"
+                  runAsUser: ">999"
+
+---
+# ----------------------------------------------------------------------------
+# 6. Require Read-Only Root Filesystem
+#    Addresses: Attacker persistence and malware installation
+#    PCI-DSS: Requirement 2.2 — System hardening
+# ----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-readonly-root-filesystem
+  annotations:
+    policies.kyverno.io/title: Require Read-Only Root Filesystem
+    policies.kyverno.io/category: Pod Security - CDE
+    policies.kyverno.io/severity: medium
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-readonly-rootfs
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [cde, payment-services]
+      validate:
+        message: >
+          Container root filesystems must be read-only. Set
+          `securityContext.readOnlyRootFilesystem: true`. Use emptyDir or
+          volume mounts for paths that require write access (e.g., /tmp).
+        pattern:
+          spec:
+            containers:
+              - securityContext:
+                  readOnlyRootFilesystem: "true"
+
+---
+# ----------------------------------------------------------------------------
+# 7. Exception Policy — Network Monitoring Sidecar (CAP_NET_RAW)
+#    Addresses the trade-off: legacy service requires elevated capability
+#    IMPORTANT: This is a narrowly scoped exception. The sidecar must still
+#    drop all other capabilities, run as non-root, and use read-only FS.
+# ----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: exception-netmon-cap-net-raw
+  annotations:
+    policies.kyverno.io/title: Exception — Network Monitor CAP_NET_RAW
+    policies.kyverno.io/category: Pod Security Exception - CDE
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >
+      Narrow exception allowing the network-monitoring sidecar container
+      (image: yuno/netmon-sidecar) to retain CAP_NET_RAW for packet capture.
+      All other security controls remain enforced. This exception must be
+      reviewed quarterly and removed when the sidecar is refactored.
+      Exception owner: platform-security@yuno.com
+      Exception expires: 2025-12-31
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: allow-netmon-cap-net-raw
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [cde, payment-services]
+              selector:
+                matchLabels:
+                  security.yuno.com/exception: "cap-net-raw-netmon"
+      validate:
+        message: >
+          Pods with the cap-net-raw exception may only have this capability
+          in the container named 'netmon-sidecar'. All other containers must
+          still drop ALL capabilities.
+        pattern:
+          spec:
+            containers:
+              - name: "netmon-sidecar"
+                securityContext:
+                  capabilities:
+                    drop: [ALL]
+                    add: [NET_RAW]
+                  runAsNonRoot: "true"
+                  allowPrivilegeEscalation: "false"
+
+---
+# ----------------------------------------------------------------------------
+# 8. Require Resource Limits
+#    Addresses: Denial-of-service / resource exhaustion attacks
+#    PCI-DSS: Requirement 6.4 — Protect system components
+# ----------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-resource-limits
+  annotations:
+    policies.kyverno.io/title: Require CPU and Memory Limits
+    policies.kyverno.io/category: Pod Security - CDE
+    policies.kyverno.io/severity: medium
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-limits
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [cde, payment-services]
+      validate:
+        message: >
+          All containers must declare CPU and memory resource limits.
+          This prevents a compromised container from exhausting node resources
+          and impacting other CDE services.
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  limits:
+                    memory: "?*"
+                    cpu: "?*"
+                  requests:
+                    memory: "?*"
+                    cpu: "?*"
